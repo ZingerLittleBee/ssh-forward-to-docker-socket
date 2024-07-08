@@ -1,5 +1,4 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -7,39 +6,13 @@ use bollard::container::{Config, RemoveContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::{Docker, API_DEFAULT_VERSION};
-use log::{error, info};
-use russh::*;
-use russh_keys::*;
-use std::sync::Arc;
-use tokio::net::TcpListener;
+use log::info;
 
+use crate::ssh::client::ForwardClient;
 use futures_util::stream::StreamExt;
 use futures_util::TryStreamExt;
 
-struct Client;
-
-#[async_trait]
-impl client::Handler for Client {
-    type Error = anyhow::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        info!("check_server_key: {:?}", server_public_key);
-        Ok(true)
-    }
-
-    async fn data(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        info!("data on channel {:?}: {}", channel, data.len());
-        Ok(())
-    }
-}
+mod ssh;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,7 +21,7 @@ async fn main() -> Result<()> {
         .init();
 
     tokio::spawn(async {
-        create_socket_forward().await.unwrap();
+        ForwardClient::new().create_socket_forward().await.unwrap();
     });
 
     let app = Router::new()
@@ -131,70 +104,4 @@ async fn exec() -> impl IntoResponse {
         .unwrap();
 
     res.join("\n")
-}
-
-async fn create_socket_forward() -> Result<()> {
-    let config = russh::client::Config::default();
-    let sh = Client {};
-
-    let mut session = russh::client::connect(Arc::new(config), ("192.168.31.214", 22), sh)
-        .await
-        .unwrap();
-    if session
-        .authenticate_password("root", "zxcv1234")
-        .await
-        .unwrap()
-    {
-        info!("Connected");
-        // let mut channel = session.channel_open_session().await.unwrap();
-        // channel.exec(true, "pwd").await?;
-        //
-        // let mut reader = channel.make_reader();
-        //
-        // let mut contents = Vec::new();
-        // reader.read_to_end(&mut contents).await?;
-        //
-        // info!("content: {}", String::from_utf8_lossy(&contents));
-
-        // listen on a local port
-        let listener = TcpListener::bind("127.0.0.1:8181").await?;
-        let local_addr = listener.local_addr()?;
-        info!("Listening on: {}", local_addr);
-
-        loop {
-            let channel = session
-                .channel_open_direct_streamlocal("/var/run/docker.sock")
-                .await
-                .unwrap();
-
-            let (mut read_half, mut write_half) = tokio::io::split(channel.into_stream());
-
-            let (mut socket, addr) = listener.accept().await?;
-
-            tokio::spawn(async move {
-                let (mut reader, mut writer) = socket.split();
-
-                tokio::select! {
-                    result = tokio::io::copy(&mut reader, &mut write_half) => {
-                        match result {
-                            Ok(bytes) => info!("Copied {} bytes from reader to write_half", bytes),
-                            Err(e) => {
-                                error!("Error copying from reader to write_half: {}", e);
-                            }
-                        }
-                    },
-                    result = tokio::io::copy(&mut read_half, &mut writer) => {
-                        match result {
-                            Ok(bytes) => info!("Copied {} bytes from read_half to writer", bytes),
-                            Err(e) => {
-                                error!("Error copying from read_half to writer: {}", e);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    Ok(())
 }
